@@ -75,6 +75,7 @@ def transcribe(
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
+    batch_size: int = 1,
     **decode_options,
 ):
     """
@@ -137,11 +138,29 @@ def transcribe(
         When word_timestamps is True, skip silent periods longer than this threshold (in seconds)
         when a possible hallucination is detected
 
+    batch_size: int
+        Number of independent 30-second windows to decode together. Values greater than one
+        require `condition_on_previous_text=False`. Batched decoding uses fixed window
+        boundaries, so callers must validate text and timestamp parity before enabling it.
+
     Returns
     -------
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
+
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if batch_size > 1 and condition_on_previous_text:
+        raise ValueError(
+            "batch_size > 1 requires condition_on_previous_text=False because "
+            "windows in the same batch cannot depend on earlier decoded text"
+        )
+    if batch_size > 1 and hallucination_silence_threshold is not None:
+        raise ValueError(
+            "batch_size > 1 does not yet preserve hallucination_silence_threshold "
+            "seek semantics"
+        )
 
     dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
     model = ModelHolder.get_model(path_or_hf_repo, dtype)
@@ -276,6 +295,254 @@ def transcribe(
             "compression_ratio": result.compression_ratio,
             "no_speech_prob": result.no_speech_prob,
         }
+
+    def transcribe_batched():
+        temperatures = (
+            [temperature] if isinstance(temperature, (int, float)) else temperature
+        )
+
+        def needs_fallback(result: DecodingResult) -> bool:
+            failed = (
+                compression_ratio_threshold is not None
+                and result.compression_ratio > compression_ratio_threshold
+            ) or (
+                logprob_threshold is not None
+                and result.avg_logprob < logprob_threshold
+            )
+            if (
+                no_speech_threshold is not None
+                and result.no_speech_prob > no_speech_threshold
+            ):
+                return False
+            return failed
+
+        def decode_batch(mel_segments: List[mx.array]) -> List[DecodingResult]:
+            final_results: List[Optional[DecodingResult]] = [None] * len(mel_segments)
+            pending = list(range(len(mel_segments)))
+
+            for current_temperature in temperatures:
+                if not pending:
+                    break
+
+                kwargs = {**decode_options}
+                if current_temperature > 0:
+                    kwargs.pop("beam_size", None)
+                    kwargs.pop("patience", None)
+                else:
+                    kwargs.pop("best_of", None)
+
+                options = DecodingOptions(
+                    **kwargs, temperature=current_temperature
+                )
+                retry_batch = mx.stack(
+                    [mel_segments[index] for index in pending], axis=0
+                )
+                retry_results = model.decode(retry_batch, options)
+                if isinstance(retry_results, DecodingResult):
+                    retry_results = [retry_results]
+
+                next_pending = []
+                for index, result in zip(pending, retry_results):
+                    final_results[index] = result
+                    if needs_fallback(result):
+                        next_pending.append(index)
+                pending = next_pending
+
+            if any(result is None for result in final_results):
+                raise RuntimeError("batched decoding did not produce every result")
+            return final_results
+
+        chunks = []
+        for seek_clip_start, seek_clip_end in seek_clips:
+            chunk_seek = seek_clip_start
+            while chunk_seek < seek_clip_end:
+                chunk_size = min(
+                    N_FRAMES,
+                    content_frames - chunk_seek,
+                    seek_clip_end - chunk_seek,
+                )
+                chunks.append((chunk_seek, chunk_size))
+                chunk_seek += chunk_size
+
+        batch_ranges = []
+        next_chunk = 0
+        if initial_prompt_tokens and chunks:
+            batch_ranges.append((0, 1))
+            next_chunk = 1
+        while next_chunk < len(chunks):
+            batch_end = min(len(chunks), next_chunk + batch_size)
+            batch_ranges.append((next_chunk, batch_end))
+            next_chunk = batch_end
+
+        last_speech_timestamp = 0.0
+        with tqdm.tqdm(
+            total=content_frames, unit="frames", disable=verbose is not False
+        ) as pbar:
+            for batch_start, batch_end in batch_ranges:
+                batch_chunks = chunks[batch_start:batch_end]
+                mel_segments = [
+                    pad_or_trim(
+                        mel[chunk_seek : chunk_seek + chunk_size],
+                        N_FRAMES,
+                        axis=-2,
+                    ).astype(dtype)
+                    for chunk_seek, chunk_size in batch_chunks
+                ]
+
+                decode_options["prompt"] = (
+                    initial_prompt_tokens if batch_start == 0 else []
+                )
+                batch_results = decode_batch(mel_segments)
+
+                for mel_segment, result, (chunk_seek, chunk_size) in zip(
+                    mel_segments, batch_results, batch_chunks
+                ):
+                    time_offset = float(chunk_seek * HOP_LENGTH / SAMPLE_RATE)
+                    segment_duration = chunk_size * HOP_LENGTH / SAMPLE_RATE
+                    tokens = np.array(result.tokens)
+
+                    if no_speech_threshold is not None:
+                        should_skip = result.no_speech_prob > no_speech_threshold
+                        if (
+                            logprob_threshold is not None
+                            and result.avg_logprob > logprob_threshold
+                        ):
+                            should_skip = False
+                        if should_skip:
+                            pbar.update(chunk_size)
+                            continue
+
+                    def batch_segment(start, end, segment_tokens):
+                        token_list = segment_tokens.tolist()
+                        text_tokens = [
+                            token for token in token_list if token < tokenizer.eot
+                        ]
+                        return {
+                            "seek": chunk_seek,
+                            "start": start,
+                            "end": end,
+                            "text": tokenizer.decode(text_tokens),
+                            "tokens": token_list,
+                            "temperature": result.temperature,
+                            "avg_logprob": result.avg_logprob,
+                            "compression_ratio": result.compression_ratio,
+                            "no_speech_prob": result.no_speech_prob,
+                        }
+
+                    current_segments = []
+                    timestamp_tokens = tokens >= tokenizer.timestamp_begin
+                    single_timestamp_ending = (
+                        timestamp_tokens[-2:].tolist() == [False, True]
+                    )
+                    consecutive = np.where(
+                        np.logical_and(
+                            timestamp_tokens[:-1], timestamp_tokens[1:]
+                        )
+                    )[0]
+                    consecutive += 1
+
+                    if len(consecutive) > 0:
+                        slices = consecutive.tolist()
+                        if single_timestamp_ending:
+                            slices.append(len(tokens))
+
+                        last_slice = 0
+                        for current_slice in slices:
+                            sliced_tokens = tokens[last_slice:current_slice]
+                            start_timestamp_pos = (
+                                sliced_tokens[0].item()
+                                - tokenizer.timestamp_begin
+                            )
+                            end_timestamp_pos = (
+                                sliced_tokens[-1].item()
+                                - tokenizer.timestamp_begin
+                            )
+                            current_segments.append(
+                                batch_segment(
+                                    time_offset
+                                    + start_timestamp_pos * time_precision,
+                                    time_offset
+                                    + end_timestamp_pos * time_precision,
+                                    sliced_tokens,
+                                )
+                            )
+                            last_slice = current_slice
+                    else:
+                        duration = segment_duration
+                        timestamps = tokens[timestamp_tokens.nonzero()[0]]
+                        if (
+                            len(timestamps) > 0
+                            and timestamps[-1].item()
+                            != tokenizer.timestamp_begin
+                        ):
+                            duration = (
+                                timestamps[-1].item()
+                                - tokenizer.timestamp_begin
+                            ) * time_precision
+                        current_segments.append(
+                            batch_segment(
+                                time_offset,
+                                time_offset + duration,
+                                tokens,
+                            )
+                        )
+
+                    if word_timestamps:
+                        add_word_timestamps(
+                            segments=current_segments,
+                            model=model,
+                            tokenizer=tokenizer,
+                            mel=mel_segment,
+                            num_frames=chunk_size,
+                            prepend_punctuations=prepend_punctuations,
+                            append_punctuations=append_punctuations,
+                            last_speech_timestamp=last_speech_timestamp,
+                        )
+                        last_word_end = _get_end(current_segments)
+                        if last_word_end is not None:
+                            last_speech_timestamp = last_word_end
+
+                    if verbose:
+                        for segment in current_segments:
+                            line = (
+                                f"[{_format_timestamp(segment['start'])} --> "
+                                f"{_format_timestamp(segment['end'])}] "
+                                f"{segment['text']}"
+                            )
+                            print(make_safe(line))
+
+                    for segment in current_segments:
+                        if (
+                            segment["start"] == segment["end"]
+                            or segment["text"].strip() == ""
+                        ):
+                            segment["text"] = ""
+                            segment["tokens"] = []
+                            segment["words"] = []
+
+                    all_segments.extend(
+                        [
+                            {"id": index, **segment}
+                            for index, segment in enumerate(
+                                current_segments, start=len(all_segments)
+                            )
+                        ]
+                    )
+                    all_tokens.extend(
+                        token
+                        for segment in current_segments
+                        for token in segment["tokens"]
+                    )
+                    pbar.update(chunk_size)
+
+        return {
+            "text": tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
+            "segments": all_segments,
+            "language": language,
+        }
+
+    if batch_size > 1:
+        return transcribe_batched()
 
     # show the progress bar when verbose is False (if True, transcribed text will be printed)
     with tqdm.tqdm(
