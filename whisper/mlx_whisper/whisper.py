@@ -52,6 +52,7 @@ class MultiHeadAttention(nn.Module):
         xa=None,
         mask=None,
         kv_cache=None,
+        use_sdpa=True,
     ):
         q = self.query(x)
 
@@ -67,11 +68,37 @@ class MultiHeadAttention(nn.Module):
         else:
             k, v = kv_cache
 
-        wv, qk = self.qkv_attention(q, k, v, mask)
+        wv, qk = self.qkv_attention(q, k, v, mask, use_sdpa=use_sdpa)
         return self.out(wv), (k, v), qk
 
-    def qkv_attention(self, q, k, v, mask=None):
+    def qkv_attention(self, q, k, v, mask=None, use_sdpa=True):
         n_batch, n_ctx, n_state = q.shape
+        n_kv_ctx = k.shape[1]
+        head_dim = n_state // self.n_head
+
+        sdpa = getattr(getattr(mx, "fast", None), "scaled_dot_product_attention", None)
+        if use_sdpa and sdpa is not None:
+            q = q.reshape(n_batch, n_ctx, self.n_head, head_dim).transpose(
+                0, 2, 1, 3
+            )
+            k = k.reshape(n_batch, n_kv_ctx, self.n_head, head_dim).transpose(
+                0, 2, 1, 3
+            )
+            v = v.reshape(n_batch, n_kv_ctx, self.n_head, head_dim).transpose(
+                0, 2, 1, 3
+            )
+
+            if mask is not None and n_ctx == n_kv_ctx:
+                mask = mask[:n_ctx, :n_kv_ctx]
+            elif mask is not None:
+                # Incremental decoding only caches past and current tokens, so
+                # every key is visible to the newly appended query token.
+                mask = None
+
+            out = sdpa(q, k, v, scale=head_dim**-0.5, mask=mask)
+            out = out.transpose(0, 2, 1, 3).reshape(n_batch, n_ctx, n_state)
+            return out, None
+
         scale = (n_state // self.n_head) ** -0.25
         q = q.reshape(*q.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3) * scale
         k = k.reshape(*k.shape[:2], self.n_head, -1).transpose(0, 2, 3, 1) * scale
@@ -104,14 +131,16 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp2 = nn.Linear(n_mlp, n_state)
         self.mlp_ln = nn.LayerNorm(n_state)
 
-    def __call__(self, x, xa=None, mask=None, kv_cache=None):
+    def __call__(self, x, xa=None, mask=None, kv_cache=None, use_sdpa=True):
         kv, cross_kv = kv_cache if kv_cache else (None, None)
-        y, kv, _ = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv)
+        y, kv, _ = self.attn(
+            self.attn_ln(x), mask=mask, kv_cache=kv, use_sdpa=use_sdpa
+        )
         x += y
         cross_qk = None
         if self.cross_attn:
             y, cross_kv, cross_qk = self.cross_attn(
-                self.cross_attn_ln(x), xa, kv_cache=cross_kv
+                self.cross_attn_ln(x), xa, kv_cache=cross_kv, use_sdpa=use_sdpa
             )
             x += y
         x = x + self.mlp2(nn.gelu(self.mlp1(self.mlp_ln(x))))
@@ -173,7 +202,7 @@ class TextDecoder(nn.Module):
             dtype
         )
 
-    def __call__(self, x, xa, kv_cache=None):
+    def __call__(self, x, xa, kv_cache=None, use_sdpa=True):
         """
         x : mx.array, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -191,7 +220,11 @@ class TextDecoder(nn.Module):
         cross_qk = [None] * len(self.blocks)
         for e, block in enumerate(self.blocks):
             x, kv_cache[e], cross_qk[e] = block(
-                x, xa, mask=self._mask, kv_cache=kv_cache[e]
+                x,
+                xa,
+                mask=self._mask,
+                kv_cache=kv_cache[e],
+                use_sdpa=use_sdpa,
             )
 
         x = self.ln(x)
@@ -248,7 +281,9 @@ class Whisper(nn.Module):
         return self.decoder(tokens, audio_features)[0]
 
     def forward_with_cross_qk(self, mel, tokens):
-        logits, _, cross_qk = self.decoder(tokens, self.encoder(mel))
+        logits, _, cross_qk = self.decoder(
+            tokens, self.encoder(mel), use_sdpa=False
+        )
         return logits, cross_qk
 
     def __call__(self, mel, tokens):
