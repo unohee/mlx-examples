@@ -52,7 +52,7 @@ class MultiHeadAttention(nn.Module):
         xa=None,
         mask=None,
         kv_cache=None,
-        use_sdpa=True,
+        use_sdpa=False,
     ):
         q = self.query(x)
 
@@ -71,7 +71,7 @@ class MultiHeadAttention(nn.Module):
         wv, qk = self.qkv_attention(q, k, v, mask, use_sdpa=use_sdpa)
         return self.out(wv), (k, v), qk
 
-    def qkv_attention(self, q, k, v, mask=None, use_sdpa=True):
+    def qkv_attention(self, q, k, v, mask=None, use_sdpa=False):
         n_batch, n_ctx, n_state = q.shape
         n_kv_ctx = k.shape[1]
         head_dim = n_state // self.n_head
@@ -131,7 +131,7 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp2 = nn.Linear(n_mlp, n_state)
         self.mlp_ln = nn.LayerNorm(n_state)
 
-    def __call__(self, x, xa=None, mask=None, kv_cache=None, use_sdpa=True):
+    def __call__(self, x, xa=None, mask=None, kv_cache=None, use_sdpa=False):
         kv, cross_kv = kv_cache if kv_cache else (None, None)
         y, kv, _ = self.attn(
             self.attn_ln(x), mask=mask, kv_cache=kv, use_sdpa=use_sdpa
@@ -172,7 +172,10 @@ class AudioEncoder(nn.Module):
         x = x + self._positional_embedding
 
         for block in self.blocks:
-            x, _, _ = block(x)
+            # Preserve the reference encoder numerics because these features are
+            # reused by word alignment. Decoder-only SDPA does not perturb the
+            # timestamp attention matrix.
+            x, _, _ = block(x, use_sdpa=False)
 
         x = self.ln_post(x)
         return x
@@ -202,7 +205,7 @@ class TextDecoder(nn.Module):
             dtype
         )
 
-    def __call__(self, x, xa, kv_cache=None, use_sdpa=True):
+    def __call__(self, x, xa, kv_cache=None, use_sdpa=False):
         """
         x : mx.array, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -280,9 +283,11 @@ class Whisper(nn.Module):
     def logits(self, tokens, audio_features):
         return self.decoder(tokens, audio_features)[0]
 
-    def forward_with_cross_qk(self, mel, tokens):
+    def forward_with_cross_qk(self, mel, tokens, audio_features=None):
+        if audio_features is None:
+            audio_features = self.encoder(mel)
         logits, _, cross_qk = self.decoder(
-            tokens, self.encoder(mel), use_sdpa=False
+            tokens, audio_features, use_sdpa=False
         )
         return logits, cross_qk
 
