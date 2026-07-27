@@ -392,16 +392,19 @@ class ApplyTimestampRules(LogitFilter):
                 )
                 mask = mask | (vocab > last_allowed)
 
-        # if sum of probability over timestamps is above any other token, sample timestamp
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        timestamp_logprob = logprobs[:, self.tokenizer.timestamp_begin :].logsumexp(
-            axis=-1, keepdims=True
+        # The common normalization constant cancels in this comparison. Avoid a
+        # redundant full-vocabulary logsumexp and subtraction on every decode step.
+        timestamp_logit = mx.logsumexp(
+            logits[:, self.tokenizer.timestamp_begin :],
+            axis=-1,
+            keepdims=True,
         )
-        max_text_token_logprob = logprobs[:, : self.tokenizer.timestamp_begin].max(
-            axis=-1, keepdims=True
+        max_text_token_logit = logits[:, : self.tokenizer.timestamp_begin].max(
+            axis=-1,
+            keepdims=True,
         )
         mask = mask | (
-            (timestamp_logprob > max_text_token_logprob)
+            (timestamp_logit > max_text_token_logit)
             & (vocab < self.tokenizer.timestamp_begin)
         )
         return logits + mx.where(mask, -mx.inf, 0.0)
